@@ -1,0 +1,4 @@
+# sha256 of the two files of NVIDIA's FlashCHORD (video_to_data @ 8c778f9, robotic_grounding/flash_chord) after
+# chord_ppo_nonfinite_guard.diff is applied; checked by reproduce/train.sh --nonfinite-guard.
+5e5556f082666f05c8e2ceba0f2dfe67d89eb72d027869d63b374163d954a5b9  src/flash_chord/envs/base.py
+ab73f0eaff7669f950b64499b0f478aa3a8465792938f55e6648dd32a86e88c3  src/flash_chord/training/ppo/runner.py

@@ -1,0 +1,50 @@
+DexDuet on the V2D Challenge
+Copyright (c) 2026 the DexDuet authors
+
+This repository is NVIDIA's FlashCHORD runtime (https://github.com/nvidia-isaac/video_to_data, commit 8c778f9,
+folder robotic_grounding/flash_chord), Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, with additions and
+modifications by the DexDuet authors. The terms are those of LICENSE: source code under Apache-2.0, documentation
+under CC-BY-4.0.
+
+- The first commit of this repository (074a658) is NVIDIA's code unchanged; `git diff 074a658 HEAD` shows every
+  change made to it.
+- Python files added for DexDuet carry "Copyright (c) 2026 the DexDuet authors". Everything added for DexDuet is
+  licensed under the same terms as the rest of the repository (LICENSE).
+- NVIDIA's files that DexDuet modifies keep NVIDIA's notice. The Python and YAML ones also carry
+  "Modifications copyright (c) 2026 the DexDuet authors". They are:
+    .gitattributes, .gitignore, docs/.gitignore, docs/configuration.md, README.md (replaced),
+    scripts/train_rl.py, src/flash_chord/configs/train.yaml, src/flash_chord/configs/training/reference_ppo.yaml,
+    src/flash_chord/envs/base.py, src/flash_chord/envs/rl.py, src/flash_chord/objectives/recon_body.py,
+    src/flash_chord/training/README.md, src/flash_chord/training/checkpoint.py,
+    src/flash_chord/training/environment.py, src/flash_chord/training/ppo/config.py,
+    src/flash_chord/training/ppo/learner.py, src/flash_chord/training/ppo/normalization.py,
+    src/flash_chord/training/ppo/rollout.py, src/flash_chord/training/ppo/runner.py.
+  tests/objectives/fixtures/recon_body_before_dexduet.py is a modified copy of NVIDIA's
+  src/flash_chord/objectives/recon_body.py and is marked the same way.
+- Parts of the added code are ported from DexDuet (https://github.com/HaoranZhangumich/DexDuet), among them the
+  A-RSI start bins and keyframe bank (src/flash_chord/lifecycle/rsi/), the two interaction rewards
+  (src/flash_chord/objectives/dexduet.py) and the Contact-AUC scorer (scripts/dexduet/contact_auc/contact_auc.py).
+  DexDuet is released under the MIT License, reproduced here:
+
+    MIT License
+
+    Copyright (c) 2025 Mandi Zhao
+    Copyright (c) 2026 the DexDuet authors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.

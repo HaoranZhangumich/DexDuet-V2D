@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
+# Modifications copyright (c) 2026 the DexDuet authors
 """Algorithm-neutral JAX boundary for vectorized reinforcement-learning environments."""
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from flash_chord.lifecycle.curriculum import CurriculumStage
+from flash_chord.lifecycle.rsi import RSIHooks
 from flash_chord.lifecycle.termination import PackedTerminationDiagnostics, TerminationDiagnostics
 from flash_chord.objectives.composition import CurriculumObjective, ObjectiveDiagnostics
 from flash_chord.runtime.jax import from_jax, to_jax
@@ -33,6 +36,9 @@ class VectorStep:
     terminal_observation: jax.Array | None = None
     critic_context: jax.Array | None = None
     terminal_critic_context: jax.Array | None = None
+    # Per-world int flag from the environment's non-finite guard (1: state went non-finite this step and the
+    # world was terminated and reset); None when the environment has no guard.
+    nonfinite: jax.Array | None = None
 
 
 @runtime_checkable
@@ -71,6 +77,9 @@ class WarpRLEnv:
         self.frame_dt = float(getattr(env, "frame_dt", 1.0))
         self.reset_to_first_frame_probability = getattr(env, "reset_to_first_frame_probability", None)
         self.immediate_first_frame_probability = getattr(env, "immediate_first_frame_probability", None)
+        # RSI reset hooks used by the training loop (host update, sidecar save/load); None for stock resets.
+        reset_policy = getattr(env, "reset_policy", None)
+        self.rsi = reset_policy if isinstance(reset_policy, RSIHooks) else None
         objective = getattr(env, "objective", None)
         if isinstance(objective, ObjectiveDiagnostics):
             self.objective_term_names = objective.term_names
@@ -100,6 +109,7 @@ class WarpRLEnv:
         else:
             self._packed_termination_diagnostics = None
         self._episode_reference_progress_array = getattr(env, "episode_reference_progress", None)
+        self._nonfinite_array = getattr(env, "nonfinite", None)
         self.critic_context_names = tuple(getattr(env, "critic_context_names", ()))
         self.critic_context_dim = len(self.critic_context_names)
         terminal_observation = getattr(env, "terminal_observation", None)
@@ -187,6 +197,7 @@ class WarpRLEnv:
             terminal_observation=terminal_observation,
             critic_context=critic_context,
             terminal_critic_context=terminal_critic_context,
+            nonfinite=None if self._nonfinite_array is None else to_jax(self._nonfinite_array),
         )
 
     def transition_metrics(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:

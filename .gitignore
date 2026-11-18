@@ -18,6 +18,14 @@ dist/
 # Generated convex-decomposition cache (regenerated on demand from object collision meshes)
 src/flash_chord/assets/.cache/
 
+# Large assets linked or copied from NVIDIA's official checkout (reproduce/setup_assets.sh)
+src/flash_chord/assets/meshes/
+src/flash_chord/assets/policies/
+
+# Default output folder of reproduce/ (RUNS) and downloaded checkpoints
+/runs/
+/checkpoints/
+
 # Runtime
 logs/
 outputs/

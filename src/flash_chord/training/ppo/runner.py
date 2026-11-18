@@ -1,10 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Modifications copyright (c) 2026 the DexDuet authors
 """Training loop, logging seams, curriculum updates, and resume behavior."""
 
 from __future__ import annotations
 
+import datetime
+import json
+import os
+import re
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -16,11 +21,23 @@ import numpy as np
 
 from flash_chord.lifecycle.curriculum import CurriculumStage
 from flash_chord.objectives.config import OBJECTIVE_TERM_NAMES
-from flash_chord.training.checkpoint import load_checkpoint, read_checkpoint_metadata, save_checkpoint
+from flash_chord.training.checkpoint import (
+    load_checkpoint,
+    read_checkpoint_metadata,
+    require_finite_resume_state,
+    save_checkpoint,
+)
 from flash_chord.training.checkpoint_metadata import validate_resume_reference_config
 from flash_chord.training.environment import JAXVectorEnv
 from flash_chord.training.ppo.config import TrainingConfig
-from flash_chord.training.ppo.learner import IterationMetrics, LearnerState, create_learner, train_iteration
+from flash_chord.training.ppo.learner import (
+    IterationMetrics,
+    LearnerState,
+    create_coordinated_learner,
+    create_learner,
+    train_iteration,
+    train_iteration_coordinated,
+)
 from flash_chord.training.progress import TrainingProgress
 
 
@@ -97,6 +114,75 @@ class WandbLogger:
 
     def close(self) -> None:
         self.run.finish()
+
+
+class JsonlLogger:
+    """Local metric sink: one JSON object per logged iteration, appended to ``path`` (resume-safe)."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a", encoding="utf-8")
+
+    def log(self, metrics: Mapping[str, float], step: int) -> None:
+        record = {"step": int(step)}
+        record.update({key: float(value) for key, value in metrics.items()})
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class TeeLogger:
+    """Forward metric records (and saved checkpoints, where supported) to several sinks."""
+
+    def __init__(self, *loggers: MetricLogger | None) -> None:
+        self.loggers = tuple(logger for logger in loggers if logger is not None)
+
+    def log(self, metrics: Mapping[str, float], step: int) -> None:
+        for logger in self.loggers:
+            logger.log(metrics, step)
+
+    def log_checkpoint(self, path: Path, *, iteration: int, metadata: Mapping[str, object]) -> None:
+        for logger in self.loggers:
+            if isinstance(logger, CheckpointLogger):
+                logger.log_checkpoint(path, iteration=iteration, metadata=metadata)
+
+    def close(self) -> None:
+        for logger in self.loggers:
+            logger.close()
+
+
+# Non-finite guard keys (TrainingConfig.nonfinite_guard). They are logged only when nonzero, and are not added to
+# metric_definitions, so the records and W&B config of a run without non-finite values match the stock runner.
+#   per_iteration: world-steps of this iteration whose state, observation, or reward was non-finite (each one was
+#                  reset, given zero advantage, and kept out of the observation normalizer);
+#   total:         the same count accumulated since this process started;
+#   termination:   fraction of completed episodes that the environment guard terminated.
+NONFINITE_ITERATION_KEY = "guard/nonfinite_world_steps_per_iteration"
+NONFINITE_TOTAL_KEY = "guard/nonfinite_world_steps_total"
+NONFINITE_TERMINATION_KEY = "termination/nonfinite_fraction_per_completed_episode"
+
+# Early stop on zero help (TrainingConfig.early_stop_help_zero_tail > 0, RSI reset only). Logged only when the option
+# is on, so other runs keep the stock records:
+#   help_zero_iterations: completed iterations since every RSI start bin reached help 0 without a break (0 before);
+#   stopped:              1.0 on the record of the iteration after which training stopped early.
+EARLY_STOP_ZERO_KEY = "early_stop/help_zero_iterations"
+EARLY_STOP_STOPPED_KEY = "early_stop/stopped"
+# <output_dir>/final.json: written once a run ends normally (early stop or max_iterations) after its final
+# checkpoint; downstream tools (reproduce/, eval_all.py) read the final iteration from it. A resumed run that will train
+# further renames an existing one to final.prev.json first.
+FINAL_MARKER = "final.json"
+FINAL_MARKER_PREVIOUS = "final.prev.json"
+FINAL_REASON_EARLY_STOP = "help_zero_tail"
+FINAL_REASON_MAX_ITERATIONS = "max_iterations"
+
+
+def _write_json_atomic(path: Path, data: Mapping[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(dict(data), indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
 
 
 def metric_definitions(env: JAXVectorEnv) -> dict[str, str]:
@@ -235,11 +321,21 @@ def metrics_to_host(
             output["reward/dense_mean_per_env_step"] = (
                 output["reward/total_mean_per_env_step"] - termination_contribution
             )
+    nonfinite_world_count = (
+        0.0 if rollout.nonfinite_world_count is None else float(np.asarray(rollout.nonfinite_world_count))
+    )
+    nonfinite_terminated_count = (
+        0.0 if rollout.nonfinite_terminated_count is None else float(np.asarray(rollout.nonfinite_terminated_count))
+    )
+    if nonfinite_world_count > 0.0:
+        output[NONFINITE_ITERATION_KEY] = nonfinite_world_count
+    if nonfinite_terminated_count > 0.0:
+        output[NONFINITE_TERMINATION_KEY] = nonfinite_terminated_count / max(episode_count, 1.0)
     cause_counts = None if rollout.termination_cause_count is None else np.asarray(rollout.termination_cause_count)
     if cause_counts is not None:
         for name, count in zip(termination_cause_names, cause_counts, strict=True):
             output[f"termination/{name}_fraction_per_completed_episode"] = float(count) / max(episode_count, 1.0)
-        classified_count = reference_end_count + float(cause_counts.sum())
+        classified_count = reference_end_count + float(cause_counts.sum()) + nonfinite_terminated_count
         if not np.isclose(classified_count, episode_count):
             raise ValueError(
                 f"exclusive outcome counts sum to {classified_count}; expected completed episode count {episode_count}"
@@ -249,6 +345,53 @@ def metrics_to_host(
         for name, mean in zip(tracking_error_names, tracking_mean, strict=True):
             output[f"tracking_error/{name}_mean_env_max_per_step"] = float(mean)
     return output
+
+
+COORDINATE_LAYOUT_METADATA_KEY = "coordinate_layout_sha256"
+_COORDINATED_GROUP_METRICS = (
+    ("ppo/policy_loss", "policy_loss_per_group"),
+    ("ppo/value_loss", "value_loss_per_group"),
+    ("ppo/explained_variance", "explained_variance_per_group"),
+    ("ppo/clip_fraction", "clip_fraction_per_group"),
+    ("ppo/advantage_raw_std", "advantage_raw_std_per_group"),
+    ("policy/action_std_mean", "action_std_mean_per_group"),
+)
+
+
+def coordinated_metrics_to_host(optimization, agent_names: tuple[str, ...]) -> dict[str, float]:
+    """Per-agent logger keys ``<prefix>_<agent>`` from coordinated optimization metrics."""
+    output = {}
+    for prefix, field_name in _COORDINATED_GROUP_METRICS:
+        values = np.asarray(getattr(optimization, field_name)).reshape(-1)
+        if values.shape != (len(agent_names),):
+            raise ValueError(f"{field_name} has shape {values.shape}; expected ({len(agent_names)},)")
+        for agent, value in zip(agent_names, values, strict=True):
+            output[f"{prefix}_{agent}"] = float(value)
+    return output
+
+
+def rsi_state_path(checkpoint: str | Path) -> Path:
+    """Sidecar RSI state path next to ``model_<N>.safetensors`` (``rsi_<N>.safetensors``)."""
+    checkpoint = Path(checkpoint)
+    name, count = re.subn(r"^model_", "rsi_", checkpoint.name)
+    if count != 1:
+        raise ValueError(f"cannot derive an RSI sidecar name from checkpoint {checkpoint.name!r}")
+    return checkpoint.with_name(name)
+
+
+def _coordinate_layout(config: TrainingConfig, checkpoint_metadata: Mapping[str, object] | None, layout):
+    if layout is not None:
+        return layout
+    from flash_chord.training.checkpoint_metadata import POLICY_SCHEMA_METADATA_KEY
+    from flash_chord.training.ppo.coordinate.layout import build_layout
+
+    schema = None if checkpoint_metadata is None else checkpoint_metadata.get(POLICY_SCHEMA_METADATA_KEY)
+    if schema is None:
+        raise ValueError(
+            "coordinated training needs a coordinate_layout or checkpoint metadata with "
+            f"{POLICY_SCHEMA_METADATA_KEY!r}"
+        )
+    return build_layout(json.loads(schema) if isinstance(schema, str) else schema, config.coordinate)
 
 
 def run_training(
@@ -261,19 +404,67 @@ def run_training(
     voc_scale_override: float | None = None,
     checkpoint_metadata: Mapping[str, object] | None = None,
     progress: TrainingProgress | None = None,
+    coordinate_layout=None,
 ) -> LearnerState:
-    """Run PPO iterations with optional logging, checkpointing, resume, and VOC override."""
+    """Run PPO iterations with optional logging, checkpointing, resume, and VOC override.
+
+    ``config.coordinate`` selects the per-hand-policy (coordinated) learner; its layout is built from the
+    ``policy_schema_json`` checkpoint metadata unless ``coordinate_layout`` is given. An environment with
+    an ``rsi`` attribute (RSI reset hooks) gets one host update per iteration and a sidecar state file
+    next to every checkpoint.
+
+    With ``config.early_stop_help_zero_tail = T > 0`` (RSI only) the loop ends after the first iteration ``N`` at
+    which every start bin has had help 0 for ``N - help_zero_since >= T`` iterations; ``model_N``/``rsi_N`` are
+    saved and ``N`` is returned in ``learner.iteration``. Whenever the run ends normally (that early stop, or
+    ``max_iterations``) and ``checkpoint_dir`` is set, ``<checkpoint_dir>/final.json`` names the final checkpoint.
+    """
     if log_interval <= 0:
         raise ValueError(f"log_interval must be positive, got {log_interval}")
     if voc_scale_override is not None and voc_scale_override < 0.0:
         raise ValueError(f"voc_scale_override must be non-negative, got {voc_scale_override}")
 
-    learner = create_learner(env, config)
+    rsi = getattr(env, "rsi", None)
+    if rsi is not None and hasattr(rsi, "stats_interval"):
+        # Refresh the RSI bank statistics on exactly the iterations whose metrics are logged.
+        rsi.stats_interval = int(log_interval)
+    early_stop_tail = int(config.early_stop_help_zero_tail)
+    help_zero_since = getattr(rsi, "help_zero_since", None) if rsi is not None else None
+    if early_stop_tail > 0 and not callable(help_zero_since):
+        raise ValueError(
+            "training.early_stop_help_zero_tail > 0 needs the RSI reset (an environment whose RSI hooks provide "
+            "help_zero_since()); set it to 0 for other resets"
+        )
+    wall_start = time.time()
+    layout = None
+    layout_sha256 = None
+    if config.coordinate is None:
+        learner = create_learner(env, config)
+    else:
+        from flash_chord.training.ppo.coordinate.layout import layout_digest
+
+        layout = _coordinate_layout(config, checkpoint_metadata, coordinate_layout)
+        layout_sha256 = layout_digest(layout)
+        learner = create_coordinated_learner(env, config, layout)
     resume_metadata: Mapping[str, str] = {}
     if config.resume:
         resume_metadata = read_checkpoint_metadata(config.checkpoint)
         validate_resume_reference_config(resume_metadata, checkpoint_metadata)
+        if layout_sha256 is not None and resume_metadata.get(COORDINATE_LAYOUT_METADATA_KEY) != layout_sha256:
+            raise ValueError(
+                "checkpoint coordinated layout does not match the current layout: "
+                f"saved={resume_metadata.get(COORDINATE_LAYOUT_METADATA_KEY)!r}, current={layout_sha256!r}"
+            )
         learner, resume_metadata = load_checkpoint(config.checkpoint, learner)
+        rsi_path = None
+        if rsi is not None:
+            rsi_path = rsi_state_path(config.checkpoint)
+            if not rsi_path.is_file():
+                raise FileNotFoundError(f"RSI resume requires the sidecar state {rsi_path}")
+        if config.nonfinite_guard:
+            # The guard stops new poisoning but cannot heal state saved by an already-poisoned run.
+            require_finite_resume_state(config.checkpoint, learner, rsi_path)
+        if rsi is not None:
+            rsi.load_state(rsi_path)
         learner = learner.replace(observation=jnp.array(env.reset(), copy=True))
     start_iteration = int(np.asarray(learner.iteration))
     sample_count = config.world_count * config.rollout_steps
@@ -281,6 +472,18 @@ def run_training(
     checkpoint_dir = None if checkpoint_dir is None else Path(checkpoint_dir)
     if progress is not None:
         progress.start(environment_steps)
+    nonfinite_total = None  # device-side cumulative guard count; read only on logged iterations
+    nonfinite_reported = 0
+    if checkpoint_dir is not None and start_iteration < config.max_iterations:
+        stale = checkpoint_dir / FINAL_MARKER
+        if stale.is_file():  # an earlier end of this run (e.g. a smaller max_iterations); training goes on
+            os.replace(stale, checkpoint_dir / FINAL_MARKER_PREVIOUS)
+            print(f"[final] training continues from iteration {start_iteration}: moved the earlier {FINAL_MARKER} "
+                  f"to {FINAL_MARKER_PREVIOUS}", flush=True)
+    final_iteration = None
+    final_reason = None
+    zero_since = None
+    zero_iterations = 0
 
     for iteration in range(start_iteration, config.max_iterations):
         stage = None
@@ -295,39 +498,75 @@ def run_training(
             env.set_curriculum(stage)
 
         start = time.perf_counter()
-        learner, metrics = train_iteration(env, learner, config)
+        rsi_metrics = rsi.host_update(iteration) if rsi is not None else {}
+        if layout is None:
+            learner, metrics = train_iteration(env, learner, config)
+        else:
+            learner, metrics = train_iteration_coordinated(env, learner, config, layout)
         environment_steps += sample_count
+        if metrics.rollout.nonfinite_world_count is not None:
+            count = metrics.rollout.nonfinite_world_count
+            nonfinite_total = count if nonfinite_total is None else nonfinite_total + count
         if progress is not None:
             progress.update(environment_steps)
-        if logger is not None and ((iteration + 1) % log_interval == 0 or iteration + 1 == config.max_iterations):
+        stop_now = False
+        if early_stop_tail > 0:
+            # host_update(iteration) above already applied this iteration's bin decisions.
+            zero_since = help_zero_since()
+            zero_iterations = 0 if zero_since is None else iteration + 1 - int(zero_since)
+            stop_now = zero_since is not None and zero_iterations >= early_stop_tail
+        if logger is not None and (
+            (iteration + 1) % log_interval == 0 or iteration + 1 == config.max_iterations or stop_now
+        ):
             jax.block_until_ready(metrics.optimization.policy_loss)
-            logger.log(
-                metrics_to_host(
-                    metrics,
-                    elapsed_seconds=time.perf_counter() - start,
-                    sample_count=sample_count,
-                    stage_index=stage_index,
-                    stage=stage,
-                    frame_dt=float(getattr(env, "frame_dt", 1.0)),
-                    objective_term_names=tuple(getattr(env, "objective_term_names", ())),
-                    termination_cause_names=tuple(getattr(env, "termination_cause_names", ())),
-                    tracking_error_names=tuple(getattr(env, "tracking_error_names", ())),
-                    reset_to_first_frame_probability=getattr(env, "reset_to_first_frame_probability", None),
-                    immediate_first_frame_probability=getattr(env, "immediate_first_frame_probability", None),
-                ),
-                step=environment_steps,
+            record = metrics_to_host(
+                metrics,
+                elapsed_seconds=time.perf_counter() - start,
+                sample_count=sample_count,
+                stage_index=stage_index,
+                stage=stage,
+                frame_dt=float(getattr(env, "frame_dt", 1.0)),
+                objective_term_names=tuple(getattr(env, "objective_term_names", ())),
+                termination_cause_names=tuple(getattr(env, "termination_cause_names", ())),
+                tracking_error_names=tuple(getattr(env, "tracking_error_names", ())),
+                reset_to_first_frame_probability=getattr(env, "reset_to_first_frame_probability", None),
+                immediate_first_frame_probability=getattr(env, "immediate_first_frame_probability", None),
             )
+            if layout is not None:
+                record.update(coordinated_metrics_to_host(metrics.optimization, layout.agent_names))
+            if rsi_metrics:
+                record.update({key: float(value) for key, value in rsi_metrics.items()})
+            if nonfinite_total is not None:
+                total = int(np.asarray(nonfinite_total))
+                if total > 0:
+                    record[NONFINITE_TOTAL_KEY] = float(total)
+                if total > nonfinite_reported:
+                    print(
+                        f"[nonfinite-guard] iteration {iteration + 1}: {total - nonfinite_reported} non-finite "
+                        f"world-steps reset since the last report ({total} total)",
+                        flush=True,
+                    )
+                    nonfinite_reported = total
+            if early_stop_tail > 0:
+                record[EARLY_STOP_ZERO_KEY] = float(zero_iterations)
+                if stop_now:
+                    record[EARLY_STOP_STOPPED_KEY] = 1.0
+            logger.log(record, step=environment_steps)
 
         if checkpoint_dir is not None and (
-            (iteration + 1) % config.save_interval == 0 or iteration + 1 == config.max_iterations
+            (iteration + 1) % config.save_interval == 0 or iteration + 1 == config.max_iterations or stop_now
         ):
             metadata = dict(checkpoint_metadata or {})
             metadata["iteration"] = iteration + 1
             metadata["environment_steps"] = environment_steps
             if stage is not None:
                 metadata["voc_scale"] = stage.voc_scale
+            if layout_sha256 is not None:
+                metadata[COORDINATE_LAYOUT_METADATA_KEY] = layout_sha256
             checkpoint_path = checkpoint_dir / f"model_{iteration + 1}.safetensors"
             save_checkpoint(checkpoint_path, learner, metadata=metadata)
+            if rsi is not None:
+                rsi.save_state(rsi_state_path(checkpoint_path))
             if isinstance(logger, CheckpointLogger):
                 artifact_metadata = {
                     "iteration": iteration + 1,
@@ -346,7 +585,40 @@ def run_training(
                     iteration=iteration + 1,
                     metadata=artifact_metadata,
                 )
+        if stop_now:
+            final_iteration, final_reason = iteration + 1, FINAL_REASON_EARLY_STOP
+            print(
+                f"[early-stop] iteration {iteration + 1}: every RSI start bin has had zero help for {zero_iterations} "
+                f"iterations (since iteration {zero_since}; tail {early_stop_tail}); stopping before max_iterations "
+                f"{config.max_iterations} with checkpoint model_{iteration + 1}",
+                flush=True,
+            )
+            break
+    else:
+        if start_iteration < config.max_iterations:
+            final_iteration, final_reason = config.max_iterations, FINAL_REASON_MAX_ITERATIONS
+            if callable(help_zero_since):
+                zero_since = help_zero_since()
 
+    if checkpoint_dir is not None and final_iteration is not None:
+        _write_json_atomic(
+            checkpoint_dir / FINAL_MARKER,
+            {
+                "iteration": final_iteration,
+                "reason": final_reason,
+                "checkpoint": f"model_{final_iteration}.safetensors",
+                "rsi_state": None if rsi is None else rsi_state_path(f"model_{final_iteration}.safetensors").name,
+                "help_zero_since": None if zero_since is None else int(zero_since),
+                "help_zero_iterations": None if zero_since is None else final_iteration - int(zero_since),
+                "early_stop_help_zero_tail": early_stop_tail,
+                "max_iterations": config.max_iterations,
+                "environment_steps": environment_steps,
+                "start_iteration": start_iteration,
+                "resumed_from": str(config.checkpoint) if config.resume else None,
+                "wall_seconds": round(time.time() - wall_start, 1),
+                "finished_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            },
+        )
     if logger is not None:
         logger.close()
     return learner

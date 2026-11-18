@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Modifications copyright (c) 2026 the DexDuet authors
 """Train the reference-tracking policy with the Warp RL environment and JAX PPO."""
 
 from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import hydra
@@ -26,7 +28,13 @@ from flash_chord.training.checkpoint_metadata import (
 )
 from flash_chord.training.environment import WarpRLEnv
 from flash_chord.training.ppo.config import TrainingConfig
-from flash_chord.training.ppo.runner import WandbLogger, metric_definitions, run_training
+from flash_chord.training.ppo.runner import (
+    JsonlLogger,
+    TeeLogger,
+    WandbLogger,
+    metric_definitions,
+    run_training,
+)
 from flash_chord.training.progress import ConsoleTrainingProgress
 
 os.environ["TZ"] = "PST8PDT,M3.2.0,M11.1.0"
@@ -40,6 +48,9 @@ def main(cfg: DictConfig) -> None:
     embodiment = instantiate_typed(cfg.embodiment, Embodiment)
     collision = instantiate_typed(cfg.collision, CollisionPolicy)
     training = instantiate_typed(cfg.training, TrainingConfig)
+    if training.nonfinite_guard:
+        # Training-only: reset worlds whose simulator state turns non-finite (no-op while all state is finite).
+        env_config = replace(env_config, nonfinite_guard=True)
     output_dir = Path(HydraConfig.get().runtime.output_dir) if cfg.output_dir is None else resolve_path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,6 +98,12 @@ def main(cfg: DictConfig) -> None:
                 mode=cfg.logging.mode,
                 dir=str(output_dir),
             )
+        # Optional local metric copy (``+logging.local_jsonl=true`` -> <output_dir>/metrics.jsonl, or a path).
+        local_jsonl = cfg.logging.get("local_jsonl", False)
+        if local_jsonl:
+            jsonl_path = output_dir / "metrics.jsonl" if local_jsonl is True else resolve_path(str(local_jsonl))
+            jsonl_logger = JsonlLogger(jsonl_path)
+            logger = jsonl_logger if logger is None else TeeLogger(logger, jsonl_logger)
         learner = run_training(
             jax_env,
             training,

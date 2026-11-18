@@ -15,7 +15,6 @@
 *.onnx filter=lfs diff=lfs merge=lfs -text
 src/flash_chord/assets/meshes/** filter=lfs diff=lfs merge=lfs -text
 src/flash_chord/assets/system_id/**/*.npz filter=lfs diff=lfs merge=lfs -text
-docs/media/*.gif filter=lfs diff=lfs merge=lfs -text
 
 # Preserve the byte-exact upstream source snapshot pinned by SOURCE.json.
 src/flash_chord/assets/urdfs/vega_sharpa/v2/upstream/vega_sharpa.urdf -whitespace

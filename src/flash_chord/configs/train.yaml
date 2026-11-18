@@ -1,9 +1,10 @@
+# Modifications copyright (c) 2026 the DexDuet authors
 defaults:
   - task: default
   - sim: rl
   - scene: train
   - collision: training
-  - embodiment: sharpa_hands
+  - embodiment: g1_dex3
   - action: residual_hand_pose
   - observation: policy
   - objective: tracking
@@ -14,7 +15,7 @@ defaults:
   - logging: wandb
   - training: reference_ppo
   - _self_
-  - experiment: sharpa_ppo
+  - experiment: g1_recon_body_coord_rsi_r2_dexduet  # this repository: G1 + Dex3 (NVIDIA's default: sharpa_ppo)
 
 output_dir: null
 voc_scale_override: null
@@ -23,4 +24,4 @@ hydra:
   job:
     chdir: false
   run:
-    dir: logs/rl/sharpa/${now:%Y-%m-%d_%H-%M-%S}_${logging.run_name}
+    dir: logs/rl/${now:%Y-%m-%d_%H-%M-%S}_${logging.run_name}

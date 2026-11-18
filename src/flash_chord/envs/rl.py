@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Modifications copyright (c) 2026 the DexDuet authors
 """RL episode semantics over the shared device-native base environment."""
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from flash_chord.lifecycle.reset import (
     ResetPolicy,
     ResetSpec,
 )
+from flash_chord.lifecycle.rsi import RSIHooks
 from flash_chord.lifecycle.termination import Termination
 from flash_chord.objectives.composition import Objective
 from flash_chord.runtime.actions import Action, PolicyAction
@@ -321,6 +323,10 @@ class RLEnv(BaseEnv):
         self.episode_length = wp.zeros(self.world_count, dtype=wp.int32, device=self.device)
         self.episode_reference_progress = wp.zeros(self.world_count, dtype=wp.float32, device=self.device)
         self._step_graph = None
+        # Optional RSI hooks (lifecycle/rsi/__init__.py); None for every stock reset policy.
+        self._rsi = reset_policy if isinstance(reset_policy, RSIHooks) else None
+        if self._rsi is not None:
+            self._rsi.bind_env(self)
 
     def _compute_critic_context(self, state, output: wp.array) -> wp.array:
         """Publish reset context and configured Markov state into one persistent buffer."""
@@ -365,6 +371,8 @@ class RLEnv(BaseEnv):
             reset_mask=selected,
             finger_scale=self.reset_policy.finger_scale,
         )
+        if self._rsi is not None:
+            self._rsi.restore(self.state_0, selected)
         wp.launch(
             reset_rl_state,
             dim=self.world_count,
@@ -415,6 +423,9 @@ class RLEnv(BaseEnv):
                 self.episode_reference_progress,
             ],
         )
+        if self._rsi is not None:
+            # After physics, termination, and reset advance; before any auto-reset overwrites the state.
+            self._rsi.on_transition(self.state_0)
         if self.config.auto_reset:
             self.reset_policy.sample(self.reset_mask, self.voc_scale)
             BaseEnv.reset(
@@ -424,6 +435,9 @@ class RLEnv(BaseEnv):
                 reset_mask=self.reset_mask,
                 finger_scale=self.reset_policy.finger_scale,
             )
+            if self._rsi is not None:
+                # Overwrite worlds that drew a keyframe start, then refresh FK, before the observation.
+                self._rsi.restore(self.state_0, self.reset_mask)
         self.observation_strategy.compute(self.state_0)
         if self.config.capture_terminal_state:
             self._compute_critic_context(self.state_0, self.critic_context)

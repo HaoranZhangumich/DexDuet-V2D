@@ -3,7 +3,7 @@
 FlashCHORD separates reusable Hydra groups from complete, validated experiment recipes. Start from a recipe and
 provide the converted reference sequence explicitly.
 
-The [configuration map](../README.md#configuration) links each YAML group to its implementation.
+The [configuration map in NVIDIA's README](https://github.com/nvidia-isaac/video_to_data/blob/8c778f905cb35f76f8e6cd6e2ea486da4fb9e0ef/robotic_grounding/flash_chord/README.md#configuration) links each YAML group to its implementation.
 
 ## Public recipes
 
@@ -67,7 +67,7 @@ camera and render-style fields.
 
 ## Additional replay and training commands
 
-Use the example paths from the [workflow](../README.md#example-data), inside the FlashCHORD container.
+Use the example paths from the [workflow in NVIDIA's README](https://github.com/nvidia-isaac/video_to_data/blob/8c778f905cb35f76f8e6cd6e2ea486da4fb9e0ef/robotic_grounding/flash_chord/README.md#example-data), inside the FlashCHORD container.
 
 ```bash
 python scripts/train_rl.py experiment=sharpa_ppo "task.parquet='${SHARPA_PARQUET}'"

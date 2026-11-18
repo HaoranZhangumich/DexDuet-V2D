@@ -1,0 +1,28 @@
+# The challenge's ReconBody objective, the object-tracking reward (objective/recon_body_objtask.yaml) and DexDuet's
+# two interaction rewards on G1 + Dex3 (objectives/dexduet.py):
+#   hand_graph  hand graph reward: the three Dex3 fingers and a palm axis calibrated once per episode
+#   ho_contact  hand-object contact reward: palm, thumb, index and middle regions, one object part
+# Each is appended after object_task when its weight is non-zero and adds frame_dt * weight * term to the score.
+# The weights keep each term's ratio to the object-tracking reward on the DexMachina suite (0.5 and 1.0 against 1.0),
+# scaled to object_task 5.0: hand_graph 2.5, ho_contact 5.0 (per-step maxima 0.05 / 0.10 at frame_dt 0.02).
+# The curriculum stage weights are what training applies, so the curriculum must carry both names
+# (curriculum/recon_body_rsi_objtask_dexduet.yaml); a missing or extra key fails at the first iteration.
+# dexduet_targets_dir must name the folder of the human targets (scripts/dexduet/; <dir>/<sequence_id>/...,
+# <dir>/dex3_region_points.npz, <dir>/TARGETS.sha256); pass objective.dexduet_targets_dir=<dir> on the command line.
+defaults:
+  - recon_body_objtask
+  - _self_
+
+hand_graph_weight: 2.5
+hand_graph_beta_dir: 5.0
+hand_graph_beta_gap: 20.0
+hand_graph_thumb_weight: 0.5
+hand_graph_gap_scale: 1.5
+hand_graph_tip_offset: 0.045
+ho_contact_weight: 5.0
+ho_contact_cap: 0.05
+ho_contact_tol: 0.01
+ho_contact_scale: 0.02
+ho_contact_touch: 0.01
+ho_contact_near: 0.5
+dexduet_targets_dir: ""

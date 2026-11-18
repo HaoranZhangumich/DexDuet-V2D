@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Modifications copyright (c) 2026 the DexDuet authors
 """BodyRecon tracking objective and binary-label-gated live force closure."""
 
 from __future__ import annotations
@@ -16,12 +17,13 @@ from flash_chord.data.reference import Reference
 from flash_chord.embodiments.base import EmbodimentLayout
 from flash_chord.embodiments.binding import DeviceRobotReference, RobotReferenceBinding
 from flash_chord.embodiments.frames import DeviceBodyFrameMap
+from flash_chord.objectives.dexduet import DexDuetTerms
 from flash_chord.objectives.wrench import batched_wrench_support, friction_cone_angles, sample_wrench_basis
 from flash_chord.runtime.actions import Action, RegularizedAction
 from flash_chord.runtime.actions.sonic import SonicJointResidualAction
 from flash_chord.runtime.command import CommandBuffers
 from flash_chord.runtime.contact import ContactTracker
-from flash_chord.utils.quat import quat_geodesic_angle, quat_mul_xyzw
+from flash_chord.utils.quat import quat_geodesic_angle, quat_inv_xyzw, quat_mul_xyzw
 
 RECON_BODY_OBJECTIVE_TERM_NAMES = (
     "termination",
@@ -38,6 +40,14 @@ RECON_BODY_OBJECTIVE_TERM_NAMES = (
     "force_closure",
 )
 _RECON_BODY_OBJECTIVE_TERM_COUNT = wp.constant(12)
+#: Optional DexDuet object task term (off by default). It is appended after the twelve stock terms only when
+#: ``object_task_weight`` is non-zero; otherwise the objective is exactly the stock one (same terms, kernels, logs).
+RECON_BODY_OBJECT_TASK_TERM_NAME = "object_task"
+_RECON_BODY_OBJECT_TASK_TERM_STRIDE = wp.constant(13)
+#: Optional DexDuet hand terms (objectives/dexduet.py). Each is appended after the earlier terms (stock, then
+#: ``object_task`` if enabled) only when its weight is non-zero; with both weights 0 nothing below changes.
+RECON_BODY_HAND_GRAPH_TERM_NAME = "hand_graph"
+RECON_BODY_HO_CONTACT_TERM_NAME = "ho_contact"
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,29 @@ class ReconBodyObjectiveConfig:
     friction_coefficient: float = 0.1
     wrench_basis_seed: int = 0
     sides: tuple[str, ...] = ("left", "right")
+    # DexDuet object task reward (dexmachina/envs/rewards.py compute_task_reward, multiply_task_rew):
+    # exp(-position_beta * |p - p_ref|) * exp(-rotation_beta * angle(q, q_ref)), metres and radians, on the object
+    # root body. Single rigid bodies only, so DexDuet's articulation factor is exactly 1. Weight 0 disables the term.
+    object_task_weight: float = 0.0
+    object_task_position_beta: float = 20.0
+    object_task_rotation_beta: float = 5.0
+    # DexDuet hand-graph reward r_hg (objectives/dexduet.py; DexDuet rewards.py compute_hand_graph_reward with the
+    # general finger rule and the Dex3 calibrated palm axis). Weight 0 disables the term.
+    hand_graph_weight: float = 0.0
+    hand_graph_beta_dir: float = 5.0
+    hand_graph_beta_gap: float = 20.0
+    hand_graph_thumb_weight: float = 0.5
+    hand_graph_gap_scale: float = 1.5
+    hand_graph_tip_offset: float = 0.045
+    # DexDuet hand-object contact reward r_hoc (DexDuet ho_contact.py). Weight 0 disables the term.
+    ho_contact_weight: float = 0.0
+    ho_contact_cap: float = 0.05
+    ho_contact_tol: float = 0.01
+    ho_contact_scale: float = 0.02
+    ho_contact_touch: float = 0.01
+    ho_contact_near: float = 0.5
+    # Offline DexDuet sidecars (scripts/dexduet/); read only when a DexDuet weight is non-zero.
+    dexduet_targets_dir: str = ""
 
     def __post_init__(self) -> None:
         values = self.weights + (
@@ -101,7 +134,86 @@ class ReconBodyObjectiveConfig:
             raise ValueError("ReconBody wrench thresholds must be non-negative")
         if self.num_wrench_basis <= 0 or self.num_friction_cone_edges <= 0:
             raise ValueError("ReconBody wrench discretization sizes must be positive")
+        object_task = (self.object_task_weight, self.object_task_position_beta, self.object_task_rotation_beta)
+        if not all(math.isfinite(value) for value in object_task):
+            raise ValueError("ReconBody object task parameters must be finite")
+        if self.object_task_position_beta < 0.0 or self.object_task_rotation_beta < 0.0:
+            raise ValueError("ReconBody object task betas must be non-negative")
+        dexduet = (
+            self.hand_graph_weight,
+            self.hand_graph_beta_dir,
+            self.hand_graph_beta_gap,
+            self.hand_graph_thumb_weight,
+            self.hand_graph_gap_scale,
+            self.hand_graph_tip_offset,
+            self.ho_contact_weight,
+            self.ho_contact_cap,
+            self.ho_contact_tol,
+            self.ho_contact_scale,
+            self.ho_contact_touch,
+            self.ho_contact_near,
+        )
+        if not all(math.isfinite(value) for value in dexduet):
+            raise ValueError("ReconBody DexDuet parameters must be finite")
+        if (
+            self.hand_graph_beta_dir <= 0.0
+            or self.hand_graph_beta_gap <= 0.0
+            or self.hand_graph_thumb_weight < 0.0
+            or self.hand_graph_gap_scale <= 0.0
+            or self.hand_graph_tip_offset < 0.0
+        ):
+            raise ValueError("ReconBody DexDuet hand graph needs betas > 0, thumb weight >= 0, gap scale > 0, tip offset >= 0")
+        if not (
+            0.0 < self.ho_contact_touch < self.ho_contact_cap
+            and self.ho_contact_tol >= 0.0
+            and self.ho_contact_scale > 0.0
+            and 0.0 <= self.ho_contact_near <= 1.0
+        ):
+            raise ValueError("ReconBody DexDuet contact needs 0 < touch < cap, tol >= 0, scale > 0 and 0 <= near <= 1")
         object.__setattr__(self, "sides", tuple(self.sides))
+
+    @property
+    def object_task_enabled(self) -> bool:
+        """Whether the optional ``object_task`` term exists (non-zero weight); stock behaviour when false."""
+        return self.object_task_weight != 0.0
+
+    @property
+    def hand_graph_enabled(self) -> bool:
+        """Whether the optional DexDuet ``hand_graph`` term exists (non-zero weight)."""
+        return self.hand_graph_weight != 0.0
+
+    @property
+    def ho_contact_enabled(self) -> bool:
+        """Whether the optional DexDuet ``ho_contact`` term exists (non-zero weight)."""
+        return self.ho_contact_weight != 0.0
+
+    @property
+    def dexduet_enabled(self) -> bool:
+        return self.hand_graph_enabled or self.ho_contact_enabled
+
+    @property
+    def term_names(self) -> tuple[str, ...]:
+        """Stock term names, plus ``object_task``, ``hand_graph``, ``ho_contact`` (in that order) when enabled."""
+        names = RECON_BODY_OBJECTIVE_TERM_NAMES
+        if self.object_task_enabled:
+            names = names + (RECON_BODY_OBJECT_TASK_TERM_NAME,)
+        if self.hand_graph_enabled:
+            names = names + (RECON_BODY_HAND_GRAPH_TERM_NAME,)
+        if self.ho_contact_enabled:
+            names = names + (RECON_BODY_HO_CONTACT_TERM_NAME,)
+        return names
+
+    @property
+    def term_weights(self) -> tuple[float, ...]:
+        """Initial weights in :attr:`term_names` order."""
+        weights = self.weights
+        if self.object_task_enabled:
+            weights = weights + (self.object_task_weight,)
+        if self.hand_graph_enabled:
+            weights = weights + (self.hand_graph_weight,)
+        if self.ho_contact_enabled:
+            weights = weights + (self.ho_contact_weight,)
+        return weights
 
     @property
     def weights(self) -> tuple[float, ...]:
@@ -310,6 +422,52 @@ def compose_recon_body_objective(
     score[world] = frame_dt * total
 
 
+@wp.func
+def object_task_rotation_distance(object_quat: wp.quat, target_quat: wp.quat) -> wp.float32:
+    """DexDuet ``reward_utils.rotation_distance`` for xyzw quaternions [rad].
+
+    DexDuet (wxyz): ``2 asin(min(|vec(q_object * conj(q_target))|, 1))``, the geodesic angle in [0, pi]; it is
+    invariant to q -> -q of either input. Inputs are normalized first (a no-op for unit quaternions).
+    """
+    difference = quat_mul_xyzw(wp.normalize(object_quat), quat_inv_xyzw(wp.normalize(target_quat)))
+    vector_norm = wp.length(wp.vec3(difference[0], difference[1], difference[2]))
+    return 2.0 * wp.asin(wp.min(vector_norm, 1.0))
+
+
+@wp.kernel
+def add_recon_body_object_task(
+    body_q: wp.array(dtype=wp.transform),
+    stock_terms: wp.array(dtype=wp.float32),
+    object_body_id: int,
+    object_target_pos_w: wp.array(dtype=wp.vec3),
+    object_target_quat_w: wp.array(dtype=wp.quat),
+    bodies_per_world: int,
+    position_beta: float,
+    rotation_beta: float,
+    weights: wp.array(dtype=wp.float32),
+    frame_dt: float,
+    terms: wp.array(dtype=wp.float32),
+    score: wp.array(dtype=wp.float32),
+) -> None:
+    """Append the DexDuet object task term to the stock terms and add it to the stock score.
+
+    DexDuet ``compute_task_reward`` with ``multiply_task_rew``: exp(-beta_pos * |p - p_ref|) * exp(-beta_rot * angle)
+    * exp(-beta_arti * 0) on the object root body; ``object_position``'s body and per-world targets.
+    """
+    world = wp.tid()
+    stock_base = world * _RECON_BODY_OBJECTIVE_TERM_COUNT
+    term_base = world * _RECON_BODY_OBJECT_TASK_TERM_STRIDE
+    for term in range(_RECON_BODY_OBJECTIVE_TERM_COUNT):
+        terms[term_base + term] = stock_terms[stock_base + term]
+
+    object_xf = body_q[world * bodies_per_world + object_body_id]
+    position_distance = wp.length(wp.transform_get_translation(object_xf) - object_target_pos_w[world])
+    rotation_distance = object_task_rotation_distance(wp.transform_get_rotation(object_xf), object_target_quat_w[world])
+    task = wp.exp(-position_beta * position_distance) * wp.exp(-rotation_beta * rotation_distance)
+    terms[term_base + _RECON_BODY_OBJECTIVE_TERM_COUNT] = task
+    score[world] = score[world] + frame_dt * weights[_RECON_BODY_OBJECTIVE_TERM_COUNT] * task
+
+
 @dataclass
 class ReconBodyObjective:
     """Device BodyRecon objective with named diagnostics and mutable curriculum weights."""
@@ -347,6 +505,12 @@ class ReconBodyObjective:
     weights: wp.array
     terms: wp.array
     score: wp.array
+    # Stock-layout term scratch, only when ``object_task`` is enabled (``terms`` then has 13 columns).
+    stock_terms: wp.array | None = None
+    # Terms before the DexDuet columns (stock [+ object_task]), only when a DexDuet term is enabled; ``terms`` then
+    # has the DexDuet columns appended (objectives/dexduet.py append_dexduet_terms).
+    pre_dexduet_terms: wp.array | None = None
+    dexduet: DexDuetTerms | None = None
 
     @classmethod
     def build(
@@ -376,6 +540,8 @@ class ReconBodyObjective:
             )
         if command.layout.num_objects != 1 or command.layout.num_bodies != 1:
             raise ValueError("ReconBody objective currently requires one rigid object")
+        if config.object_task_enabled and command.layout.num_articulations != 0:
+            raise ValueError("ReconBody object task term supports rigid objects only (articulation factor is 1)")
         scalar = embodiment.scalar_joints
         if scalar is None or len(scalar.names) != 43:
             raise ValueError("ReconBody objective requires the exact 43-joint G1+Dex3 layout")
@@ -420,6 +586,22 @@ class ReconBodyObjective:
         )
         cone_cos, cone_sin = friction_cone_angles(config.num_friction_cone_edges)
         support_size = world_count * len(config.sides) * command.layout.num_bodies * config.num_wrench_basis
+        dexduet = None
+        pre_dexduet_count = len(RECON_BODY_OBJECTIVE_TERM_NAMES) + int(config.object_task_enabled)
+        if config.dexduet_enabled:
+            dexduet = DexDuetTerms.build(
+                config,
+                model,
+                embodiment,
+                reference,
+                contact,
+                object_body_id=command.layout.body_ids[0],
+                bodies_per_world=model.body_count // world_count,
+                world_count=world_count,
+                frame_dt=frame_dt,
+                pre_count=pre_dexduet_count,
+                device=device,
+            )
         return cls(
             config=config,
             world_count=world_count,
@@ -451,18 +633,27 @@ class ReconBodyObjective:
             wrench_contact_enabled=wp.ones(contact.layout.slots_per_world, dtype=wp.int32, device=device),
             current_wrench_support=wp.zeros(support_size, dtype=wp.float32, device=device),
             force_closure=wp.zeros(world_count, dtype=wp.float32, device=device),
-            weights=wp.array(config.weights, dtype=wp.float32, device=device),
+            weights=wp.array(config.term_weights, dtype=wp.float32, device=device),
             terms=wp.zeros(
-                world_count * len(RECON_BODY_OBJECTIVE_TERM_NAMES),
+                world_count * len(config.term_names),
                 dtype=wp.float32,
                 device=device,
             ),
             score=wp.zeros(world_count, dtype=wp.float32, device=device),
+            stock_terms=(
+                wp.zeros(world_count * len(RECON_BODY_OBJECTIVE_TERM_NAMES), dtype=wp.float32, device=device)
+                if config.object_task_enabled
+                else None
+            ),
+            pre_dexduet_terms=(
+                wp.zeros(world_count * pre_dexduet_count, dtype=wp.float32, device=device) if dexduet is not None else None
+            ),
+            dexduet=dexduet,
         )
 
     @property
     def term_names(self) -> tuple[str, ...]:
-        return RECON_BODY_OBJECTIVE_TERM_NAMES
+        return self.config.term_names
 
     def set_weights(self, weights: Mapping[str, float]) -> None:
         if set(weights) != set(self.term_names):
@@ -555,5 +746,31 @@ class ReconBodyObjective:
                 self.weights,
                 self.frame_dt,
             ],
-            outputs=[self.terms, self.score],
+            outputs=[self._pre_dexduet_output() if self.stock_terms is None else self.stock_terms, self.score],
         )
+        if self.stock_terms is not None:
+            wp.launch(
+                add_recon_body_object_task,
+                dim=self.world_count,
+                inputs=[
+                    state.body_q,
+                    self.stock_terms,
+                    self.object_body_id,
+                    self.command.body_target_pos_w,
+                    self.command.body_target_quat_w,
+                    self.bodies_per_world,
+                    self.config.object_task_position_beta,
+                    self.config.object_task_rotation_beta,
+                    self.weights,
+                    self.frame_dt,
+                ],
+                outputs=[self._pre_dexduet_output(), self.score],
+            )
+        if self.dexduet is not None:
+            self.dexduet.evaluate(
+                state, timestep, self.contact, self.pre_dexduet_terms, self.weights, self.terms, self.score
+            )
+
+    def _pre_dexduet_output(self) -> wp.array:
+        """The buffer the stock (+ object_task) terms are written to: ``terms`` unless a DexDuet term is enabled."""
+        return self.terms if self.pre_dexduet_terms is None else self.pre_dexduet_terms

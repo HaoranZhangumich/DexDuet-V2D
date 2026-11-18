@@ -1,0 +1,193 @@
+Non-finite guard for CHORD (PPO) on episode 07 (reproduce/README.md, "CHORD (PPO), episode 07").
+
+Applies to NVIDIA's FlashCHORD, video_to_data @ 8c778f905cb35f76f8e6cd6e2ea486da4fb9e0ef, folder
+robotic_grounding/flash_chord, in a separate copy of the checkout:  git -C <copy>/robotic_grounding/flash_chord apply <this file>
+After the physics substeps of each environment step, a world whose joint state is non-finite gets its solver
+accelerations cleared and its episode ended with zero reward, so the environment resets it; the trainer prints how
+many worlds were reset. Worlds with finite states are not changed. The patched files keep NVIDIA's license header
+(SPDX-License-Identifier: Apache-2.0).
+
+--- a/src/flash_chord/envs/base.py
++++ b/src/flash_chord/envs/base.py
+@@ -87,6 +87,67 @@
+     truncated[world] = 0
+ 
+ 
++# Non-finite guard (not in NVIDIA's release). After the physics step, a world whose joint state is non-finite gets its
++# solver accelerations cleared and its episode ended with zero reward, so the environment resets it like any other
++# terminated world. Worlds with finite states are not changed.
++@wp.kernel
++def nonfinite_detect(
++    joint_q: wp.array(dtype=wp.float32),
++    joint_qd: wp.array(dtype=wp.float32),
++    q_start: wp.array(dtype=wp.int32),
++    qd_start: wp.array(dtype=wp.int32),
++    coord_count: int,
++    dof_count: int,
++    flag: wp.array(dtype=wp.int32),
++    count: wp.array(dtype=wp.int32),
++    qacc_warmstart: wp.array2d(dtype=wp.float32),
++    qacc: wp.array2d(dtype=wp.float32),
++) -> None:
++    """Flag worlds whose joint state is non-finite and clear their solver accelerations."""
++    world = wp.tid()
++    bad = int(0)
++    for i in range(coord_count):
++        if not wp.isfinite(joint_q[q_start[world] + i]):
++            bad = 1
++    for i in range(dof_count):
++        if not wp.isfinite(joint_qd[qd_start[world] + i]):
++            bad = 1
++    flag[world] = bad
++    if bad == 0:
++        return
++    wp.atomic_add(count, 0, 1)
++    for j in range(qacc_warmstart.shape[1]):
++        qacc_warmstart[world, j] = 0.0
++        qacc[world, j] = 0.0
++
++
++@wp.kernel
++def nonfinite_terminate(
++    flag: wp.array(dtype=wp.int32),
++    terminated: wp.array(dtype=wp.int32),
++    score: wp.array(dtype=wp.float32),
++    terms: wp.array(dtype=wp.float32),
++    term_count: int,
++    packed: wp.array(dtype=wp.float32),
++    packed_width: int,
++    pelvis_done: wp.array(dtype=wp.int32),
++) -> None:
++    """End the episode of a flagged world with zero reward, so that it is reset."""
++    world = wp.tid()
++    if flag[world] == 0:
++        return
++    terminated[world] = 1
++    score[world] = 0.0
++    for t in range(term_count):
++        terms[world * term_count + t] = 0.0
++    if packed_width > 0:
++        packed[world * packed_width] = 1.0
++        for i in range(1, packed_width):
++            packed[world * packed_width + i] = 0.0
++    if pelvis_done.shape[0] > 0:
++        pelvis_done[world] = 1
++
++
+ class BaseEnv:
+     """World-parallel physics, control, reference, termination, and reset state."""
+ 
+@@ -243,6 +304,7 @@
+             device=self.device,
+         )
+         self._transition_graph = None
++        self._nonfinite_setup()
+ 
+     def reset(
+         self,
+@@ -286,6 +348,78 @@
+             ],
+         )
+ 
++    def _nonfinite_setup(self) -> None:
++        """Buffers of the non-finite guard."""
++        w = self.world_count
++        m = self.model
++        self._nonfinite_coord_count = m.joint_coord_count // w
++        self._nonfinite_dof_count = m.joint_dof_count // w
++        self._nonfinite_q_start = wp.array(
++            m.joint_coord_world_start.numpy()[:w].astype(np.int32), dtype=wp.int32, device=self.device
++        )
++        self._nonfinite_qd_start = wp.array(
++            m.joint_dof_world_start.numpy()[:w].astype(np.int32), dtype=wp.int32, device=self.device
++        )
++        self._nonfinite_flag = wp.zeros(w, dtype=wp.int32, device=self.device)
++        self._nonfinite_count = wp.zeros(1, dtype=wp.int32, device=self.device)
++        self._nonfinite_reported = 0
++        self._nonfinite_empty_f = wp.zeros(1, dtype=wp.float32, device=self.device)
++        self._nonfinite_empty_i = wp.zeros(0, dtype=wp.int32, device=self.device)
++        data = self.solver.mjw_data
++        if data.qacc_warmstart.shape[0] != w:
++            raise ValueError(f"mjw_data has {data.qacc_warmstart.shape[0]} worlds, expected {w}")
++        self._nonfinite_qacc_warmstart = data.qacc_warmstart
++        self._nonfinite_qacc = data.qacc
++        print(f"[nonfinite guard] on: {w} worlds", flush=True)
++
++    def _nonfinite_detect(self) -> None:
++        wp.launch(
++            nonfinite_detect,
++            dim=self.world_count,
++            inputs=[
++                self.state_0.joint_q,
++                self.state_0.joint_qd,
++                self._nonfinite_q_start,
++                self._nonfinite_qd_start,
++                self._nonfinite_coord_count,
++                self._nonfinite_dof_count,
++            ],
++            outputs=[
++                self._nonfinite_flag,
++                self._nonfinite_count,
++                self._nonfinite_qacc_warmstart,
++                self._nonfinite_qacc,
++            ],
++        )
++
++    def _nonfinite_terminate(self) -> None:
++        terms = getattr(self.objective, "terms", None)
++        score = getattr(self.objective, "score", None)
++        packed = getattr(self.termination, "packed_diagnostics", None)
++        pelvis_done = getattr(self.termination, "pelvis_done", None)
++        wp.launch(
++            nonfinite_terminate,
++            dim=self.world_count,
++            inputs=[self._nonfinite_flag],
++            outputs=[
++                self.terminated,
++                self._nonfinite_empty_f if score is None else score,
++                self._nonfinite_empty_f if terms is None else terms,
++                0 if terms is None else terms.shape[0] // self.world_count,
++                self._nonfinite_empty_f if packed is None else packed,
++                0 if packed is None else packed.shape[0] // self.world_count,
++                self._nonfinite_empty_i if pelvis_done is None else pelvis_done,
++            ],
++        )
++
++    def nonfinite_report(self, iteration: int) -> None:
++        """Print how many worlds the guard has reset when that number has grown."""
++        count = int(self._nonfinite_count.numpy()[0])
++        if count != self._nonfinite_reported:
++            print(f"[nonfinite guard] iteration {iteration}: {count - self._nonfinite_reported} world(s) reset, "
++                  f"{count} in total", flush=True)
++            self._nonfinite_reported = count
++
+     def _transition(self) -> None:
+         self.command.gather(self.timestep)
+         self.action.prepare_control(self.control)
+@@ -317,12 +451,14 @@
+                 self.state_0.assign(self.state_1)
+             else:
+                 self.state_0, self.state_1 = self.state_1, self.state_0
++        self._nonfinite_detect()
+         self.solver.update_contacts(self.contacts, self.state_0)
+         if self.contact is not None:
+             self.contact.update(self.model, self.state_0, self.contacts)
+         self.termination.evaluate(self.state_0.body_q, self.timestep)
+         if self.objective is not None:
+             self.objective.evaluate(self.state_0, self.timestep, self.terminated)
++        self._nonfinite_terminate()
+         self._advance_lifecycle()
+ 
+     def _advance_lifecycle(self) -> None:
+--- a/src/flash_chord/training/ppo/runner.py
++++ b/src/flash_chord/training/ppo/runner.py
+@@ -296,6 +296,9 @@
+ 
+         start = time.perf_counter()
+         learner, metrics = train_iteration(env, learner, config)
++        nonfinite_report = getattr(getattr(env, "env", None), "nonfinite_report", None)
++        if nonfinite_report is not None:
++            nonfinite_report(iteration + 1)
+         environment_steps += sample_count
+         if progress is not None:
+             progress.update(environment_steps)
