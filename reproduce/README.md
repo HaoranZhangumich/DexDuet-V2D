@@ -1,6 +1,6 @@
 # Reproduce the V2D results (G1 + Dex3)
 
-These scripts reproduce the paper's V2D results for DexDuet, DexDuet without interaction rewards and CHORD (PPO) on
+These scripts reproduce the V2D results of the [DexDuet paper](https://arxiv.org/abs/2611.30495) for DexDuet, DexDuet without interaction rewards and CHORD (PPO) on
 the 30 Tier-1 episodes of the V2D Challenge, Track 2, at the same training budget.
 
 There are two routes:

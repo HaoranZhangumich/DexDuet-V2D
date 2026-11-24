@@ -1,6 +1,6 @@
 <h1 align="center">DexDuet on the V2D Challenge</h1>
-<p align="center">Unitree G1 + Dex3 · NVIDIA FlashCHORD · <a href="https://github.com/HaoranZhangumich/DexDuet">main DexDuet repository</a></p>
-<p align="center"><b>2nd place, V2D Challenge Track 2</b> · <a href="https://github.com/RCL-Robotics/nv-v2d-hoi">challenge implementation for all three tiers</a></p>
+<p align="center">Unitree G1 + Dex3 · NVIDIA FlashCHORD · <a href="https://arxiv.org/abs/2611.30495">paper</a> · <a href="https://rcl-robotics.github.io/Dexduet.io/">project page</a> · <a href="https://github.com/HaoranZhangumich/DexDuet">main DexDuet repository</a></p>
+<p align="center">Our entry to the NVIDIA V2D Challenge, built on DexDuet: 🏆 <b>Industry Innovation Award</b> · 🥈 <b>2nd place, Track 2 (Robotic Grounding)</b><br><a href="https://github.com/RCL-Robotics/nv-v2d-hoi">challenge implementation for all three tiers</a></p>
 
 <p align="center">
   <img src="media/ep12.gif" width="100%" alt="Flip a pallet"><br>
@@ -39,6 +39,17 @@ bash reproduce/run_all.sh --gpus 0,1,2,3 --per-gpu 2                   # or trai
 Not included here: the V2D Challenge data and submission kit, NVIDIA's video_to_data checkout, and the robot meshes and
 SONIC whole-body policy (`reproduce/setup_assets.sh` takes them from that checkout). [Setup](reproduce/README.md#setup)
 lists what you need.
+
+## Citation
+
+```bibtex
+@article{zhang2026dexduet,
+  title   = {DexDuet: Learning Contact-Preserving Bimanual Dexterity from Human Demonstrations},
+  author  = {Zhang, Haoran and Ding, Haokai and Zhou, Han and Lu, Zuxing and Zhang, Heng and Zuo, Xingxing},
+  journal = {arXiv preprint arXiv:2611.30495},
+  year    = {2026}
+}
+```
 
 ## License
 

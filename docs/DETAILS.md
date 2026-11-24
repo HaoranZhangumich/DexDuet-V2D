@@ -24,7 +24,8 @@ The task: a humanoid must reproduce a human demonstration of moving an object, f
 motion. The G1 positions the Dex3 hands with its arms. The challenge's official evaluator runs the policy from the first
 frame and measures how closely the object follows its demonstrated path.
 
-DexDuet changes four things in FlashCHORD's PPO recipe. Observations, termination and the PPO settings stay as in the
+DexDuet brings its three components to FlashCHORD's PPO recipe (items 1, 2 and 4 below) and adds the
+object-tracking reward that the interaction-reward weights are set relative to (item 3). Observations, termination and the PPO settings stay as in the
 challenge's recipe, because the evaluator requires its observation layout.
 
 1. **Per-hand policies.** Each arm and hand is controlled by its own policy, the two hand policies share their
@@ -35,7 +36,7 @@ challenge's recipe, because the evaluator requires its observation layout.
    not only at its first frame. The demonstration is split into segments, and each segment gets its own level of
    assistance: a controller that pulls the object toward its demonstrated pose. A segment's assistance is lowered
    when episodes that start there succeed and kept where they fail. Episodes start from states the policy reached
-   earlier, more often in the segments where it fails, and a quarter of them start at the first frame. Training
+   earlier, more often in the segments where it fails, and a quarter of them are forced to start at the first frame. Training
    stops a fixed number of iterations after all assistance is gone, or at the cap of 20,000 iterations.
    Code: `src/flash_chord/lifecycle/rsi/`, `src/flash_chord/lifecycle/rsi_reset.py`, config `reset/recon_body_rsi.yaml`.
 3. **Object-tracking reward.** A reward for keeping the object at its demonstrated position and orientation.
@@ -208,8 +209,8 @@ MP-SR if they are below 3 cm and 30°. In the evaluator's result files SP-SR is 
 challenge leaderboard; `chord_sr` there is CHORD's own success rate and is not SP-SR. MPPE is the mean error of six points placed 5 cm from the object's origin along its axes. Contact-AUC measures whether each robot
 hand keeps the human's contacts: in short windows in which a human hand holds the object without sliding, the matching
 robot hand must touch the object (one of its surface points within 5 mm of it) and the object must not slide against
-that hand; windows in which the object is lost (more than 5 cm off its path) count as failures. The paper's
-supplementary material defines it in full. On V2D it uses 64 surface points on each of the eight collision links of
+that hand; windows in which the object is lost (more than 5 cm off its path) count as failures. The appendix of the
+[paper](https://arxiv.org/abs/2611.30495) defines it in full. On V2D it uses 64 surface points on each of the eight collision links of
 each Dex3 hand and the 2,847 vertices of each SOMA-X human hand.
 
 **Hardware and time.** DexDuet was trained on NVIDIA RTX PRO 6000 Blackwell GPUs (96 GB), about 10 h per run with two
