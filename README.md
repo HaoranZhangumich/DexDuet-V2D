@@ -1,6 +1,6 @@
 <h1 align="center">DexDuet on the V2D Challenge</h1>
 <p align="center">Unitree G1 + Dex3 · NVIDIA FlashCHORD · <a href="https://arxiv.org/abs/2611.30495">paper</a> · <a href="https://rcl-robotics.github.io/Dexduet.io/">project page</a> · <a href="https://github.com/HaoranZhangumich/DexDuet">main DexDuet repository</a></p>
-<p align="center">Our entry to the NVIDIA V2D Challenge, built on DexDuet: 🏆 <b>Industry Innovation Award</b> · 🥈 <b>2nd place, Track 2 (Robotic Grounding)</b><br><a href="https://github.com/RCL-Robotics/nv-v2d-hoi">challenge implementation for all three tiers</a></p>
+<p align="center">Our entry to the NVIDIA V2D Challenge, built on DexDuet: 🏆 <b>Industry Innovation Award</b> · 🥈 <b>2nd place, Track 2 (Robotic Grounding)</b><br><a href="https://github.com/RCL-Robotics/nv-v2d-challenge-rcl-group-solution">challenge implementation for all three tiers</a></p>
 
 <p align="center">
   <img src="media/ep12.gif" width="100%" alt="Flip a pallet"><br>
